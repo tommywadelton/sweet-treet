@@ -1,0 +1,488 @@
+import os
+import shutil
+import time
+import requests
+from urllib.parse import urlparse
+from datetime import datetime
+import base64
+from PIL import Image, ExifTags
+from PIL.ExifTags import TAGS, GPSTAGS
+import folium
+from folium import IFrame, Element
+import geopandas as gpd
+from shapely.geometry import Point
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from webdriver_manager.chrome import ChromeDriverManager
+
+# ---------------- CONFIGURATION ----------------
+Shared_Album_images = 'https://www.icloud.com/sharedalbum/#B2KGWZuqDG1VWyU'
+image_folder = "/Users/tommywadelton/Sweet Treets/Trees"
+resized_folder = "/Users/tommywadelton/Sweet Treets/Trees_Resized"
+html_folder = "/Users/tommywadelton/Sweet Treets/Map_HTML"
+countries_path = "/Users/tommywadelton/Sweet Treets/Countries_Zip/ne_110m_admin_0_countries.shp"
+
+SCROLL_PAUSE = 5
+MAX_SCROLLS = 100
+MAX_RETRIES = 5
+
+# ---------------- CREATE FOLDERS ----------------
+os.makedirs(image_folder, exist_ok=True)
+os.makedirs(resized_folder, exist_ok=True)
+os.makedirs(html_folder, exist_ok=True)
+
+# ---------------- CLEAR IMAGE FOLDER ----------------
+for folder in [image_folder, resized_folder]:
+    if os.path.exists(folder):
+        for filename in os.listdir(folder):
+            file_path = os.path.join(folder, filename)
+            try:
+                if os.path.isfile(file_path) or os.path.islink(file_path):
+                    os.unlink(file_path)
+                elif os.path.isdir(file_path):
+                    shutil.rmtree(file_path)
+            except Exception as e:
+                print(f"Failed to delete {file_path}: {e}")
+print("✅ Cleared image folders")
+
+# ---------------- HELPER FUNCTIONS ----------------
+def wait_for_elements(driver, timeout=30):
+    WebDriverWait(driver, timeout).until(
+        EC.presence_of_all_elements_located((By.CLASS_NAME, 'x-stream-photo-grid-item-view'))
+    )
+
+def get_gps_from_exif(image_path):
+    try:
+        with Image.open(image_path) as img:
+            exif_data = img._getexif()
+    except Exception as e:
+        print(f"Error opening image: {e}")
+        return None
+
+    if not exif_data:
+        return None
+
+    gps_info = {}
+    date_taken = None
+
+    for tag, value in exif_data.items():
+        decoded = TAGS.get(tag, tag)
+        if decoded == "GPSInfo":
+            for gps_tag, gps_value in value.items():
+                decoded_gps = GPSTAGS.get(gps_tag, gps_tag)
+                gps_info[decoded_gps] = gps_value
+        elif decoded == "DateTimeOriginal":
+            date_taken = value
+
+    if not gps_info:
+        return None
+
+    def to_float(val):
+        if isinstance(val, tuple) and len(val) == 2:
+            return float(val[0]) / float(val[1])
+        if hasattr(val, 'numerator') and hasattr(val, 'denominator'):
+            return float(val.numerator) / float(val.denominator)
+        return float(val)
+
+    def convert_to_decimal(dms, ref):
+        degrees = to_float(dms[0])
+        minutes = to_float(dms[1])
+        seconds = to_float(dms[2])
+        decimal = degrees + minutes / 60 + seconds / 3600
+        if ref in ("S", "W"):
+            decimal *= -1
+        return decimal
+
+    try:
+        lat = convert_to_decimal(gps_info["GPSLatitude"], gps_info["GPSLatitudeRef"])
+        lon = convert_to_decimal(gps_info["GPSLongitude"], gps_info["GPSLongitudeRef"])
+        return {"latitude": lat, "longitude": lon, "date": date_taken}
+    except Exception as e:
+        return None
+
+def auto_orient_image(img):
+    try:
+        for orientation in ExifTags.TAGS.keys():
+            if ExifTags.TAGS[orientation] == 'Orientation':
+                break
+        exif = img._getexif()
+        if not exif:
+            return img
+        exif = dict(exif.items())
+        if exif.get(orientation) == 3:
+            img = img.rotate(180, expand=True)
+        elif exif.get(orientation) == 6:
+            img = img.rotate(270, expand=True)
+        elif exif.get(orientation) == 8:
+            img = img.rotate(90, expand=True)
+    except Exception:
+        pass
+    return img
+
+def create_popup_html(resized_filepath, lat, lon, date_taken=None):
+    # Embed image as base64 so it works anywhere, no file path dependency
+    with open(resized_filepath, "rb") as f:
+        img_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+    ext = os.path.splitext(resized_filepath)[1].lower().strip(".")
+    mime = "jpeg" if ext in ("jpg", "jpeg") else ext
+    img_src = f"data:image/{mime};base64,{img_b64}"
+
+    date_html  = f"<p>📅 {date_taken}</p>" if date_taken else ""
+    gmaps_link = f"https://www.google.com/maps?q={lat},{lon}"
+
+    html = f"""
+    <div style="width:300px;">
+        <img src="{img_src}" style="width:100%;">
+        {date_html}
+        <p><a href="{gmaps_link}" target="_blank">Take me to the tree 🌲</a></p>
+    </div>
+    """
+    return folium.Popup(folium.IFrame(html, width=320, height=420))
+
+
+# ---------------- SELENIUM IMAGE DOWNLOAD ----------------
+options = Options()
+options.add_argument('--headless')
+options.add_argument('--disable-gpu')
+options.add_argument('--no-sandbox')
+options.add_argument('--window-size=1920,1080')
+service = Service(ChromeDriverManager().install())
+driver = webdriver.Chrome(service=service, options=options)
+
+try:
+    driver.get(Shared_Album_images)
+    time.sleep(5)
+    image_urls = set()
+    scroll_count = 0
+    previous_count = 0
+    retry_attempts = 0
+
+    print("🌐 Gathering Photos from iCloud...")
+    while scroll_count < MAX_SCROLLS:
+        body = driver.find_element(By.TAG_NAME, "body")
+        body.send_keys(Keys.PAGE_DOWN)
+        time.sleep(SCROLL_PAUSE)
+        scroll_count += 1
+        wait_for_elements(driver)
+
+        imgs = driver.find_elements(By.TAG_NAME, "img")
+        for img in imgs:
+            src = img.get_attribute("src")
+            if src and "icloud-content.com" in src:
+                image_urls.add(src)
+
+        divs = driver.find_elements(By.CLASS_NAME, "x-stream-photo-grid-item-view")
+        for div in divs:
+            style = div.get_attribute("style")
+            if style and "url(" in style:
+                start = style.find("url(") + 4
+                end = style.find(")", start)
+                url = style[start:end].strip('"').strip("'")
+                if "icloud-content.com" in url:
+                    image_urls.add(url)
+
+        current_count = len(image_urls)
+        if current_count == previous_count:
+            retry_attempts += 1
+            if retry_attempts >= MAX_RETRIES:
+                break
+        else:
+            retry_attempts = 0
+        previous_count = current_count
+
+    print(f"✅ Total images gathered: {len(image_urls)}")
+
+    # Save images
+    for idx, url in enumerate(image_urls):
+        try:
+            parsed = urlparse(url)
+            ext = os.path.splitext(parsed.path)[1] or '.jpg'
+            filename = f"img_{idx}{ext}"
+            filepath = os.path.join(image_folder, filename)
+            if os.path.exists(filepath):
+                continue
+            response = requests.get(url, timeout=15)
+            if response.status_code == 200:
+                with open(filepath, "wb") as f:
+                    f.write(response.content)
+            else:
+                print(f"Failed to download {filename}: status {response.status_code}")
+        except Exception as e:
+            print(f"Error downloading image {idx}: {e}")
+finally:
+    driver.quit()
+    print("✅ Selenium driver closed")
+
+
+image_files = [f for f in os.listdir(image_folder) if f.lower().endswith((".jpg", ".jpeg", ".png", ".webp", ".heic"))]
+if not image_files:
+    print("No images found.")
+    exit()
+
+m = folium.Map(location=[39.0, -105.5], zoom_start=7, tiles=None)
+
+folium.TileLayer(
+    tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}",
+    attr="Tiles &copy; Esri",
+    name="Topo",
+    control=False
+).add_to(m)
+
+all_coords   = []
+all_countries = set()
+world        = gpd.read_file(countries_path)
+tree_layer   = folium.FeatureGroup(name="Trees")  # ← single layer, before loop
+
+# ── SINGLE LOOP ────────────────────────────────────────────────────────────
+for image_file in image_files:
+    full_image_path = os.path.join(image_folder, image_file)
+    gps = get_gps_from_exif(full_image_path)
+    if not gps:
+        continue
+
+    # Resize
+    resized_file = os.path.join(resized_folder, f"Resized_{os.path.basename(image_file)}")
+    with Image.open(full_image_path) as img:
+        img = auto_orient_image(img)
+        img = img.resize((400, 400))
+        img.save(resized_file)
+
+    lat, lon = gps["latitude"], gps["longitude"]
+    all_coords.append([lat, lon])
+
+    # Country lookup
+    try:
+        point = Point(lon, lat)
+        match = world[world.contains(point)]
+        if not match.empty:
+            all_countries.add(match.iloc[0]["ADMIN"])
+    except Exception:
+        pass
+
+    # Date formatting
+    raw_date = gps.get("date")
+    try:
+        dt_obj       = datetime.strptime(raw_date, "%Y:%m:%d %H:%M:%S")
+        formatted_date = dt_obj.strftime("%m-%d-%y %I:%M %p")
+    except Exception:
+        dt_obj         = None
+        formatted_date = None
+
+    # Popup
+    popup = create_popup_html(resized_file, lat, lon, formatted_date)
+
+    # Seasonal icon
+    if dt_obj:
+        month, day = dt_obj.month, dt_obj.day
+        if   (month == 3 and day >= 22) or month in [4, 5] or (month == 6 and day < 22):
+            icon_html = "🌱"
+        elif (month == 6 and day >= 22) or month in [7, 8] or (month == 9 and day < 22):
+            icon_html = "🌳"
+        elif (month == 9 and day >= 22) or month in [10, 11] or (month == 12 and day < 22):
+            icon_html = "🍂"
+        else:
+            icon_html = "🎄"
+    else:
+        icon_html = "🌳"
+
+    folium.Marker(
+        [lat, lon],
+        popup=popup,
+        icon=folium.DivIcon(html=f'<div style="font-size:32px;">{icon_html}</div>')
+    ).add_to(tree_layer)  # ← always adding to the same layer
+
+# ── AFTER LOOP ─────────────────────────────────────────────────────────────
+tree_layer.add_to(m)
+folium.LayerControl().add_to(m)
+
+responsive_js = """
+<script>
+document.addEventListener("DOMContentLoaded", function() {
+    setTimeout(function() {
+
+        // ── Find Leaflet map ───────────────────────────────────────────
+        var mapVar = Object.values(window).find(function(v) {
+            return v && typeof v === 'object' && v._leaflet_id && v.getCenter;
+        });
+        if (!mapVar) return;
+
+        var isMobile = mapVar.getContainer().offsetWidth < 600;
+
+        // ── TITLE ──────────────────────────────────────────────────────
+        var title = document.createElement('div');
+        title.innerHTML = '🌲 Sweet Treets 🌲';
+        title.style.cssText = [
+            'position: fixed',
+            'top: 10px',
+            'left: 50%',
+            'transform: translateX(-50%)',
+            'z-index: 99999',
+            'background: rgba(255,255,255,0.92)',
+            'border: 1px solid #aaa',
+            'border-radius: 10px',
+            'box-shadow: 0 2px 8px rgba(0,0,0,0.15)',
+            'pointer-events: none',
+            'white-space: nowrap',
+            isMobile ? 'font-size: 14px; padding: 5px 12px;'
+                     : 'font-size: 24px; padding: 8px 20px;'
+        ].join(';');
+        document.body.appendChild(title);
+
+        // ── BANNER (tree + country counts) ────────────────────────────
+        var banner = document.getElementById('stat-banner');
+        if (banner) {
+            banner.style.fontSize  = isMobile ? '11px' : '16px';
+            banner.style.padding   = isMobile ? '6px 10px' : '10px 16px';
+            banner.style.gap       = isMobile ? '10px' : '20px';
+            banner.style.top       = isMobile ? '48px' : '70px';
+        }
+
+        // ── LEGEND ─────────────────────────────────────────────────────
+        var legend = document.getElementById('season-legend');
+        if (legend) {
+            legend.style.fontSize = isMobile ? '11px'  : '16px';
+            legend.style.padding  = isMobile ? '6px 8px' : '10px';
+            legend.style.bottom   = isMobile ? '20px'  : '50px';
+            legend.style.right    = isMobile ? '10px'  : '50px';
+        }
+
+        // ── POPUP position ─────────────────────────────────────────────
+        mapVar.on('popupopen', function(e) {
+            var popup      = e.popup;
+            var mapWidth   = mapVar.getContainer().offsetWidth;
+            var clickPoint = mapVar.latLngToContainerPoint(popup.getLatLng());
+            var targetX    = mapWidth < 600 ? mapWidth / 2 : 220;
+            popup.setLatLng(
+                mapVar.containerPointToLatLng(window.L.point(targetX, clickPoint.y))
+            );
+        });
+
+    }, 500);
+});
+</script>
+"""
+m.get_root().html.add_child(Element(responsive_js))
+
+tree_count    = len(all_coords)
+country_count = len(all_countries)
+countries_list = ", ".join(sorted(all_countries)) if all_countries else "—"
+
+# Update legend to add id:
+legend_html = """
+<div id="season-legend" style="
+    position: fixed;
+    bottom: 50px;
+    right: 50px;
+    background: white;
+    padding: 10px;
+    border: 2px solid gray;
+    border-radius: 5px;
+    font-size: 16px;
+    z-index: 99999;
+    pointer-events: none;
+">
+    <strong>Season Legend:</strong><br>
+    🌱 Spring (Mar 22 – Jun 21)<br>
+    🌳 Summer (Jun 22 – Sep 21)<br>
+    🍂 Fall (Sep 22 – Dec 21)<br>
+    🎄 Winter (Dec 22 – Mar 21)
+</div>
+"""
+m.get_root().html.add_child(Element(legend_html))
+
+# Update banner to add id:
+banner_html = f"""
+<div id="stat-banner" title="Countries: {countries_list}" style="
+    position: fixed; top: 70px; left: 50%; transform: translateX(-50%);
+    z-index: 9999; background: rgba(255,255,255,0.92); border: 1px solid #aaa;
+    border-radius: 10px; padding: 10px 16px; font-size: 16px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.15); display: flex; gap: 20px; align-items: center;">
+    <div><strong>🌲 Trees:</strong> {tree_count}</div>
+    <div><strong>🌍 Countries:</strong> {country_count}</div>
+</div>
+"""
+m.get_root().html.add_child(Element(banner_html))
+
+# Add the responsive JS last, after everything else
+m.get_root().html.add_child(Element(responsive_js))
+
+# Save
+output_path = os.path.join(html_folder, "index.html")
+m.save(output_path)
+print("✅ Map saved:", output_path)
+print(f"🌲 Trees: {tree_count} | 🌍 Countries: {country_count} | Countries: {countries_list}")
+
+import requests
+import os
+
+username = 'tommywadelton'
+repo = 'sweet-treet'
+token = 'github_pat_1'
+branch = 'main'
+commit_message = 'Update index.html via Python'
+
+# Change to the correct directory
+os.chdir('/Users/tommywadelton/Sweet Treets/Map_HTML')
+local_file_path = 'index.html'
+repo_file_path = 'index.html'  # File path in the repo
+
+# GitHub API URL to get file info
+get_url = f'https://api.github.com/repos/{username}/{repo}/contents/{repo_file_path}?ref={branch}'
+
+# Headers
+
+headers = {
+    "Authorization": f"Bearer {token}",
+    "Accept": "application/vnd.github+json",
+    "X-GitHub-Api-Version": "2022-11-28",
+}
+
+
+# Get the current SHA
+get_response = requests.get(get_url, headers=headers)
+if get_response.status_code == 200:
+    sha = get_response.json()['sha']
+else:
+    print(f"Error fetching SHA: {get_response.status_code}")
+    print(get_response.json())
+    sha = None
+
+# Read and encode the file
+with open(local_file_path, 'rb') as f:
+    content = base64.b64encode(f.read()).decode('utf-8')
+
+# Prepare the payload
+payload = {
+    "message": commit_message,
+    "content": content,
+    "branch": branch
+}
+if sha:
+    payload["sha"] = sha
+
+# GitHub API URL to update the file
+put_url = f'https://api.github.com/repos/{username}/{repo}/contents/{repo_file_path}'
+
+# Make the request
+put_response = requests.put(put_url, json=payload, headers=headers)
+
+from datetime import datetime
+
+# Get the current date and time
+current_datetime = datetime.now()
+
+# Check result
+if put_response.status_code == 200:
+    print(f"File updated successfully on {current_datetime}./n")
+elif put_response.status_code == 201:
+    print("File created successfully.")
+else:
+    print(f"Error: {put_response.status_code}")
+    print(put_response.json())
+    
